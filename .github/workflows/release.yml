@@ -1,0 +1,45 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          zig-version: 0.14.1
+
+      - name: Build
+        run: |
+          zig build-lib runproxied_hook.zig hde/hde64.c -I hde -dynamic -target x86_64-windows-gnu -lc -femit-bin=runproxied.dll -O ReleaseFast
+          zig build-exe runproxied.zig -target x86_64-windows-gnu -femit-bin=runproxied.exe -O ReleaseFast
+
+      - name: Package
+        run: |
+          mkdir dist
+          cp runproxied.exe runproxied.dll dist/
+          cp README.md LICENSE dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: runproxied-windows-x64
+          path: dist/
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
