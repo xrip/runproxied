@@ -1,0 +1,9 @@
+*.exe
+*.dll
+*.pdb
+*.lib
+*.log
+*.obj
+*.o
+zig-cache/
+zig-out/
