@@ -6,7 +6,6 @@ const BOOL = i32;
 const DWORD = u32;
 const HANDLE = ?*anyopaque;
 const SIZE_T = usize;
-const LPSTR = [*:0]u8;
 
 const STARTUPINFOW = extern struct {
     cb: DWORD,
@@ -46,12 +45,14 @@ extern "kernel32" fn CloseHandle(h: HANDLE) callconv(.winapi) BOOL;
 extern "kernel32" fn GetModuleHandleA(n: ?[*:0]const u8) callconv(.winapi) HANDLE;
 extern "kernel32" fn GetProcAddress(h: HANDLE, n: [*:0]const u8) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn GetLastError() callconv(.winapi) DWORD;
-extern "kernel32" fn GetFullPathNameA(n: [*:0]const u8, len: DWORD, buf: [*]u8, part: ?*?[*:0]u8) callconv(.winapi) DWORD;
-extern "kernel32" fn WaitForSingleObjectEx(h: HANDLE, ms: DWORD, alertable: BOOL) callconv(.winapi) DWORD;
 
 extern "kernel32" fn GetCommandLineW() callconv(.winapi) [*:0]u16;
 extern "kernel32" fn LocalFree(h: ?*anyopaque) callconv(.winapi) ?*anyopaque;
 extern "shell32" fn CommandLineToArgvW(cmd: [*:0]const u16, argc: *c_int) callconv(.winapi) ?[*]?[*:0]u16;
+
+extern "kernel32" fn GetExitCodeThread(h: HANDLE, code: *DWORD) callconv(.winapi) BOOL;
+extern "kernel32" fn TerminateProcess(h: HANDLE, code: u32) callconv(.winapi) BOOL;
+extern "kernel32" fn VirtualFreeEx(h: HANDLE, addr: ?*anyopaque, size: SIZE_T, typ: DWORD) callconv(.winapi) BOOL;
 
 const CREATE_SUSPENDED: DWORD = 0x4;
 const MEM_COMMIT: DWORD = 0x1000;
@@ -59,11 +60,16 @@ const MEM_RESERVE: DWORD = 0x2000;
 const MEM_RELEASE: DWORD = 0x8000;
 const PAGE_READWRITE: DWORD = 0x4;
 const INFINITE: DWORD = 0xFFFFFFFF;
-const STILL_ACTIVE: DWORD = 259;
 
 fn die(msg: []const u8) noreturn {
     std.debug.print("runproxied: {s}\n", .{msg});
     std.process.exit(1);
+}
+
+fn dieChild(pi: *PROCESS_INFORMATION, msg: []const u8) noreturn {
+    // kill the suspended child so no zombie survives a failed injection
+    _ = TerminateProcess(pi.hProcess, 1);
+    die(msg);
 }
 
 fn utf8ToUtf16Alloc(a: std.mem.Allocator, s: []const u8) ![:0]u16 {
@@ -123,15 +129,15 @@ pub fn main() !void {
     var dll_path: ?[]const u8 = null;
     var quiet = false;
     var i: usize = 1;
-    while (i < args.len) : (i += 1) {
+    while (i < args_n) : (i += 1) {
         const a = args[i][0..args_lens[i]];
         if (std.mem.eql(u8, a, "--proxy")) {
             i += 1;
-            if (i >= args.len) die("--proxy needs a value");
+            if (i >= args_n) die("--proxy needs a value");
             proxy = args[i][0..args_lens[i]];
         } else if (std.mem.eql(u8, a, "--dll")) {
             i += 1;
-            if (i >= args.len) die("--dll needs a value");
+            if (i >= args_n) die("--dll needs a value");
             dll_path = args[i][0..args_lens[i]];
         } else if (std.mem.eql(u8, a, "--quiet") or std.mem.eql(u8, a, "-q")) {
             quiet = true;
@@ -142,13 +148,13 @@ pub fn main() !void {
             break;
         }
     }
-    if (i >= args.len) {
+    if (i >= args_n) {
         std.debug.print("usage: runproxied.exe [--proxy socks5h://user:pass@host:port] [--dll runproxied.dll] [--quiet] -- target.exe [args...]\n", .{});
         std.debug.print("default dll: runproxied.dll next to runproxied.exe; proxy: --proxy or built-in default\n", .{});
         return;
     }
 
-    // dll path: --dll or agyproxy.dll next to this exe
+    // dll path: --dll or runproxied.dll next to this exe
     var dll_buf: [1024]u8 = undefined;
     var dll_z: [*:0]const u8 = undefined;
     if (dll_path) |dp| {
@@ -157,9 +163,8 @@ pub fn main() !void {
         dll_buf[dp.len] = 0;
         dll_z = @ptrCast(&dll_buf);
     } else {
-        // find our own exe dir
         var self_buf: [1024]u8 = undefined;
-        const self_n = GetModuleFileNameA_impl(&self_buf);
+        const self_n: usize = GetModuleFileNameA(null, &self_buf, 1024);
         var dir_end: usize = self_n;
         while (dir_end > 0 and self_buf[dir_end - 1] != '\\') dir_end -= 1;
         const name = "runproxied.dll";
@@ -196,18 +201,16 @@ pub fn main() !void {
     if (cl_len >= cl_buf.len) die("command line too long");
     cl_buf[cl_len] = 0;
 
-    // set AGY_PROXY in our environment before CreateProcess (child inherits)
+    // set env vars in our environment; the child inherits them
     if (quiet) {
         _ = SetEnvironmentVariableA("AGYPROXY_QUIET", "1");
     }
     if (proxy) |p| {
-        var env_buf: [1024]u8 = undefined;
-        if (p.len + 10 >= env_buf.len) die("proxy url too long");
-        @memcpy(env_buf[0..9], "AGY_PROXY");
-        env_buf[9] = '=';
-        @memcpy(env_buf[10 .. 10 + p.len], p);
-        env_buf[10 + p.len] = 0;
-        _ = c_putenv(@ptrCast(&env_buf));
+        var val_buf: [1024]u8 = undefined;
+        if (p.len >= val_buf.len) die("proxy url too long");
+        @memcpy(val_buf[0..p.len], p);
+        val_buf[p.len] = 0;
+        _ = SetEnvironmentVariableA("AGY_PROXY", @ptrCast(&val_buf));
     }
 
     // wide command line
@@ -229,48 +232,33 @@ pub fn main() !void {
     // classic injection: VirtualAllocEx + WriteProcessMemory + CreateRemoteThread(LoadLibraryA)
     const dll_len = std.mem.len(dll_z) + 1;
     const remote = VirtualAllocEx(pi.hProcess, null, dll_len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) orelse {
-        _ = ResumeThread(pi.hThread);
-        die("VirtualAllocEx failed");
+        dieChild(&pi, "VirtualAllocEx failed");
     };
     _ = WriteProcessMemory(pi.hProcess, remote, @ptrCast(dll_z), dll_len, null);
 
     const k32 = GetModuleHandleA("kernel32.dll");
     const loadlib = GetProcAddress(k32, "LoadLibraryA") orelse die("no LoadLibraryA");
     const t = CreateRemoteThread(pi.hProcess, null, 0, @ptrCast(loadlib), remote, 0, null) orelse {
-        _ = ResumeThread(pi.hThread);
-        die("CreateRemoteThread failed");
+        dieChild(&pi, "CreateRemoteThread failed");
     };
     _ = WaitForSingleObject(t, 10000);
+    var load_rc: DWORD = 0;
+    _ = GetExitCodeThread(t, &load_rc);
     _ = CloseHandle(t);
+    _ = VirtualFreeEx(pi.hProcess, remote, 0, MEM_RELEASE);
+    if (load_rc == 0) {
+        dieChild(&pi, "failed to load the DLL in the target (wrong path or architecture?); aborting so traffic does not leak outside the proxy");
+    }
 
     _ = ResumeThread(pi.hThread);
 
     // wait for the child and forward its exit code
     _ = WaitForSingleObject(pi.hProcess, INFINITE);
     var code: DWORD = 0;
-    _ = GetExitCodeProcess_impl(pi.hProcess, &code);
+    _ = GetExitCodeProcess(pi.hProcess, &code);
     std.process.exit(@intCast(code & 0xff));
 }
 
 extern "kernel32" fn SetEnvironmentVariableA(name: [*:0]const u8, value: [*:0]const u8) callconv(.winapi) BOOL;
-fn c_putenv(kv: [*:0]const u8) c_int {
-    // kv is "AGY_PROXY=..." ; split at '='
-    const s = std.mem.span(kv);
-    const eq = std.mem.indexOfScalar(u8, s, '=') orelse return -1;
-    var name_buf: [64]u8 = undefined;
-    if (eq >= name_buf.len) return -1;
-    @memcpy(name_buf[0..eq], s[0..eq]);
-    name_buf[eq] = 0;
-    const val: [*:0]const u8 = @ptrCast(kv + eq + 1);
-    return if (SetEnvironmentVariableA(@ptrCast(&name_buf), val) != 0) 0 else -1;
-}
-
 extern "kernel32" fn GetModuleFileNameA(h: HANDLE, buf: [*]u8, n: DWORD) callconv(.winapi) DWORD;
-fn GetModuleFileNameA_impl(buf: [*]u8) usize {
-    return @intCast(GetModuleFileNameA(null, buf, 1024));
-}
-
 extern "kernel32" fn GetExitCodeProcess(h: HANDLE, code: *DWORD) callconv(.winapi) BOOL;
-fn GetExitCodeProcess_impl(h: HANDLE, code: *DWORD) BOOL {
-    return GetExitCodeProcess(h, code);
-}
