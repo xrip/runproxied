@@ -16,9 +16,12 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Zig
-        uses: mlugg/setup-zig@v1
-        with:
-          version: 0.14.1
+        run: |
+          ZIG_VERSION=0.14.1
+          URL=$(curl -sSL https://ziglang.org/download/index.json | jq -r --arg v "$ZIG_VERSION" '.[$v]."x86_64-linux".tarball')
+          mkdir -p /opt/zig
+          curl -sSL --retry 5 "$URL" | tar -xJ -C /opt/zig --strip-components=1
+          echo "/opt/zig" >> "$GITHUB_PATH"
 
       - name: Build
         run: |

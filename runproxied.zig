@@ -49,6 +49,10 @@ extern "kernel32" fn GetLastError() callconv(.winapi) DWORD;
 extern "kernel32" fn GetFullPathNameA(n: [*:0]const u8, len: DWORD, buf: [*]u8, part: ?*?[*:0]u8) callconv(.winapi) DWORD;
 extern "kernel32" fn WaitForSingleObjectEx(h: HANDLE, ms: DWORD, alertable: BOOL) callconv(.winapi) DWORD;
 
+extern "kernel32" fn GetCommandLineW() callconv(.winapi) [*:0]u16;
+extern "kernel32" fn LocalFree(h: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+extern "shell32" fn CommandLineToArgvW(cmd: [*:0]const u16, argc: *c_int) callconv(.winapi) ?[*]?[*:0]u16;
+
 const CREATE_SUSPENDED: DWORD = 0x4;
 const MEM_COMMIT: DWORD = 0x1000;
 const MEM_RESERVE: DWORD = 0x2000;
@@ -66,18 +70,48 @@ fn utf8ToUtf16Alloc(a: std.mem.Allocator, s: []const u8) ![:0]u16 {
     return std.unicode.utf8ToUtf16LeAllocZ(a, s);
 }
 
+fn utf16ToUtf8Buf(w: []const u16, out: []u8) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < w.len) {
+        const c0 = w[i];
+        i += 1;
+        if (c0 < 0x80) {
+            if (n + 1 > out.len) break;
+            out[n] = @intCast(c0);
+            n += 1;
+        } else if (c0 < 0x800) {
+            if (n + 2 > out.len) break;
+            out[n] = @intCast(0xC0 | (c0 >> 6));
+            out[n + 1] = @intCast(0x80 | (c0 & 0x3F));
+            n += 2;
+        } else {
+            if (n + 3 > out.len) break;
+            out[n] = @intCast(0xE0 | (c0 >> 12));
+            out[n + 1] = @intCast(0x80 | ((c0 >> 6) & 0x3F));
+            out[n + 2] = @intCast(0x80 | (c0 & 0x3F));
+            n += 3;
+        }
+    }
+    return n;
+}
+
 pub fn main() !void {
     const gpa = std.heap.page_allocator;
     var args_buf: [64][1024]u8 = undefined;
     var args_lens: [64]usize = undefined;
     var args_n: usize = 0;
     {
-        // read args via the std iterator
-        var it = std.process.Args.Iterator.initAllocator(std.process.Args{ .vector = std.os.windows.peb().ProcessParameters.CommandLine.slice() }, gpa) catch die("args");
-        while (it.next()) |a| {
-            if (args_n >= args_buf.len) break;
-            const n = @min(a.len, args_buf[args_n].len);
-            @memcpy(args_buf[args_n][0..n], a[0..n]);
+        // read args via CommandLineToArgvW (version-independent, no std.process API drift)
+        var argc: c_int = 0;
+        const argv = CommandLineToArgvW(GetCommandLineW(), &argc) orelse die("args");
+        defer _ = LocalFree(@ptrCast(argv));
+        var k: usize = 0;
+        while (k < @as(usize, @intCast(argc)) and args_n < args_buf.len) : (k += 1) {
+            const w: [*:0]const u16 = @ptrCast(argv[k]);
+            var wlen: usize = 0;
+            while (w[wlen] != 0) wlen += 1;
+            const n = utf16ToUtf8Buf(w[0..wlen], &args_buf[args_n]);
             args_lens[args_n] = n;
             args_n += 1;
         }

@@ -224,13 +224,52 @@ fn stub_gqcsex(p: ?*anyopaque, e: [*]OVERLAPPED_ENTRY, m: u32, r: *u32, ms: u32)
 // ---------------------------------------------------------------------------
 // logging
 // ---------------------------------------------------------------------------
-var log_path: [320]u8 = @splat(0);
+var log_path: [640]u8 = @splat(0);
 var log_path_len: usize = 0;
 var log_ready: bool = false;
 var log_lock: usize = 0;
 var verbose: bool = false;
 
 var log_off: bool = false;
+
+fn logBuildPath() bool {
+    // log next to the target exe, named <exe>.runproxied.log, so several
+    // proxied programs never fight over one file
+    var exepath: [600]u8 = @splat(0);
+    const en = GetModuleFileNameA(null, &exepath, 590);
+    if (en == 0 or en > 590) return false;
+    var dir_end: usize = @intCast(en);
+    while (dir_end > 0 and exepath[dir_end - 1] != '\\') dir_end -= 1;
+    var stem_end: usize = @intCast(en);
+    while (stem_end > dir_end and exepath[stem_end - 1] != '.') stem_end -= 1;
+    var stem_len: usize = @as(usize, @intCast(en)) - dir_end; // whole name if no extension
+    if (stem_end > dir_end) stem_len = stem_end - 1 - dir_end; // exclude the dot
+    const tail = ".runproxied.log";
+    const total = dir_end + stem_len + tail.len;
+    if (total + 1 > log_path.len) return false;
+    @memcpy(log_path[0..dir_end], exepath[0..dir_end]);
+    @memcpy(log_path[dir_end .. dir_end + stem_len], exepath[dir_end .. dir_end + stem_len]);
+    @memcpy(log_path[dir_end + stem_len .. total], tail);
+    log_path[total] = 0;
+    // verify the directory is writable; otherwise fall back to %TEMP%
+    const probe = CreateFileA(@ptrCast(&log_path), 4, 3, null, 4, 0x80, null);
+    if (probe) |f| {
+        _ = CloseHandle(f);
+        log_path_len = total;
+        return true;
+    }
+    var tmp: [320]u8 = @splat(0);
+    const n = GetTempPathA(300, &tmp);
+    if (n == 0 or n > 300) return false;
+    var pid_s: [16]u8 = @splat(0);
+    const ps = std.fmt.bufPrint(&pid_s, "runproxied-{d}.log", .{GetCurrentProcessId()}) catch return false;
+    if (n + ps.len + 1 > log_path.len) return false;
+    @memcpy(log_path[0..n], tmp[0..n]);
+    @memcpy(log_path[n .. n + ps.len], ps);
+    log_path[n + ps.len] = 0;
+    log_path_len = n + ps.len;
+    return true;
+}
 
 fn logInit() void {
     if (log_ready) return;
@@ -241,18 +280,11 @@ fn logInit() void {
         log_ready = true;
         return;
     }
-    var tmp: [300]u8 = @splat(0);
-    const n = GetTempPathA(280, &tmp);
-    if (n == 0 or n > 280) return;
-    const tail = "runproxied.log";
-    @memcpy(tmp[n .. n + tail.len], tail);
-    tmp[n + tail.len] = 0;
-    @memcpy(log_path[0 .. n + tail.len + 1], tmp[0 .. n + tail.len + 1]);
-    log_path_len = n + tail.len;
     var vb: [8]u8 = @splat(0);
     const vn = GetEnvironmentVariableA("AGYPROXY_VERBOSE", &vb, vb.len);
     verbose = vn >= 1 and vb[0] == '1';
     log_ready = true;
+    if (!logBuildPath()) log_off = true;
 }
 
 fn logRaw(msg: []const u8) void {

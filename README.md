@@ -39,7 +39,7 @@ Environment variables (usually set automatically by the launcher):
 - `AGYPROXY_VERBOSE=1` — verbose log.
 - `AGYPROXY_QUIET=1` — no log file.
 
-Without `--quiet`, a diagnostic log is written to `%TEMP%\runproxied.log`.
+Without `--quiet`, a diagnostic log is written next to the target executable as `<exename>.runproxied.log` (each proxied program gets its own file; if the directory is not writable, it falls back to `%TEMP%\runproxied-<pid>.log`).
 
 ## Building
 
